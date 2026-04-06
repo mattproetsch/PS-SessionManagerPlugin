@@ -30,7 +30,10 @@ param(
     [string]$Profile,
     [string]$Region,
     [string]$SshKeyPath,
-    [string]$DocumentName = 'SSM-StartSSHSession'
+    [string]$DocumentName = 'SSM-StartSSHSession',
+    # API Proxy — when set, starts an OpenAI-compatible reverse proxy on LocalPort
+    [string]$UpstreamUrl,
+    [string]$ApiKey
 )
 
 $ErrorActionPreference = 'Stop'
@@ -199,7 +202,26 @@ for ($i = 0; $i -lt $maxWait; $i++) {
 }
 if ($i -ge $maxWait) { throw "Run Command timed out after $($maxWait*2) seconds." }
 
-# ── 4. Start Reverse Tunnel ─────────────────────────────────────────────────
+# ── 4. Start API Proxy (optional) ───────────────────────────────────────────
+
+$proxyJob = $null
+if ($UpstreamUrl) {
+    if (-not $ApiKey) { throw '-ApiKey is required when -UpstreamUrl is specified.' }
+    Write-Step "Starting API proxy on port $LocalPort -> $UpstreamUrl"
+    $proxyScript = Join-Path $ScriptDir 'Start-ApiProxy.ps1'
+    $proxyJob = Start-Job -ScriptBlock {
+        param($Script, $Port, $Url, $Key)
+        & $Script -ListenPort $Port -UpstreamUrl $Url -ApiKey $Key
+    } -ArgumentList $proxyScript, $LocalPort, $UpstreamUrl, $ApiKey
+    Start-Sleep -Seconds 1
+    if ($proxyJob.State -eq 'Failed') {
+        Receive-Job $proxyJob -ErrorAction SilentlyContinue
+        throw 'API proxy failed to start.'
+    }
+    Write-Ok "API proxy running on 127.0.0.1:$LocalPort -> $UpstreamUrl"
+}
+
+# ── 5. Start Reverse Tunnel ─────────────────────────────────────────────────
 
 Write-Host ""
 Write-Step "Starting reverse tunnel: $InstanceId`:$RemotePort --> localhost:$LocalPort"
@@ -217,10 +239,18 @@ $sessJson = ConvertTo-Json $sess -Compress -Depth 10
 
 Write-Ok "Tunnel active: $InstanceId`:$RemotePort --> localhost:$LocalPort"
 
-# Launch ssm-port-forward.ps1 in SSH Bridge mode
-& "$ScriptDir/ssm-port-forward.ps1" $sessJson $resolvedRegion 'StartSession' '' `
-    (ConvertTo-Json @{Target=$InstanceId} -Compress) "https://ssm.$resolvedRegion.amazonaws.com" `
-    -SshBridgeMode -SshUser $SshUser -SshKeyPath $SshKeyPath `
-    -SshBindAddress '0.0.0.0' -SshBindPort $RemotePort -SshLocalPort $LocalPort
+try {
+    # Launch ssm-port-forward.ps1 in SSH Bridge mode
+    & "$ScriptDir/ssm-port-forward.ps1" $sessJson $resolvedRegion 'StartSession' '' `
+        (ConvertTo-Json @{Target=$InstanceId} -Compress) "https://ssm.$resolvedRegion.amazonaws.com" `
+        -SshBridgeMode -SshUser $SshUser -SshKeyPath $SshKeyPath `
+        -SshBindAddress '0.0.0.0' -SshBindPort $RemotePort -SshLocalPort $LocalPort
+} finally {
+    if ($proxyJob) {
+        Write-Step 'Stopping API proxy...'
+        Stop-Job $proxyJob -ErrorAction SilentlyContinue
+        Remove-Job $proxyJob -Force -ErrorAction SilentlyContinue
+    }
+}
 
 Write-Ok "Tunnel closed."
