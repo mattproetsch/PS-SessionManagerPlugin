@@ -316,7 +316,7 @@ function Parse-SmuxFrames {
             $SMUX_PSH {
                 if($fdata -and $script:streamMode -eq 'ssh-bridge' -and $sid -eq $script:sshSmuxId){
                     # Route to SSH client channel
-                    $null = $script:ssmToSsh.Writer.TryWrite([byte[]]$fdata)
+                    $script:ssmToSsh.Add([byte[]]$fdata)
                 } elseif($fdata -and $script:conns.ContainsKey($sid)){
                     $script:conns[$sid].Pending.Add($fdata)
                 }
@@ -423,7 +423,7 @@ function Process-DataPayload($msg) {
                 Parse-SmuxFrames
             } elseif($script:streamMode -eq 'ssh-bridge'){
                 # SSH Bridge without smux: feed data directly
-                $null = $script:ssmToSsh.Writer.TryWrite([byte[]]$msg.Payload)
+                $script:ssmToSsh.Add([byte[]]$msg.Payload)
             } elseif($script:streamMode -eq 'stdio'){
                 # StandardStreamForwarding: write to stdout
                 if($script:stdoutStream){
@@ -607,10 +607,10 @@ $script:stdoutStream = $null
 $script:stdinTask    = $null
 $script:stdinBuf     = $null
 # SSH Bridge mode state
-$script:ssmToSsh     = $null       # Channel<byte[]> SSM -> SSH
-$script:sshToSsm     = $null       # Channel<byte[]> SSH -> SSM
-$script:sshThread    = $null       # Background thread running SSH client
-$script:sshCts       = $null       # CancellationTokenSource for SSH
+$script:ssmToSsh     = $null       # BlockingCollection<byte[]> SSM -> SSH
+$script:sshToSsm     = $null       # BlockingCollection<byte[]> SSH -> SSM
+$script:sshHandle    = $null       # IAsyncResult from PowerShell.BeginInvoke
+$script:sshPs        = $null       # PowerShell runspace for SSH client
 
 # ── Connect WebSocket ────────────────────────────────────────────────────────
 
@@ -704,9 +704,8 @@ while($script:running -and $script:ws.State -eq [System.Net.WebSockets.WebSocket
                 [Console]::Error.WriteLine("Opened smux stream $($script:sshSmuxId) for SSH bridge.")
             }
 
-            $script:ssmToSsh = [System.Threading.Channels.Channel]::CreateUnbounded[byte[]]()
-            $script:sshToSsm = [System.Threading.Channels.Channel]::CreateUnbounded[byte[]]()
-            $script:sshCts   = [System.Threading.CancellationTokenSource]::new()
+            $script:ssmToSsh = [System.Collections.Concurrent.BlockingCollection[byte[]]]::new()
+            $script:sshToSsm = [System.Collections.Concurrent.BlockingCollection[byte[]]]::new()
 
             $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
             . "$ScriptDir/SshClient.ps1"
@@ -715,19 +714,18 @@ while($script:running -and $script:ws.State -eq [System.Net.WebSockets.WebSocket
 
             # Use a PowerShell runspace for the SSH thread (raw .NET threads lack a PS runspace)
             $sshScriptContent = Get-Content "$ScriptDir/SshClient.ps1" -Raw
-            $paramLine = 'param($FromSsm, $ToSsm, $Username, $PrivateKey, $BindAddress, [int]$BindPort, [int]$LocalPort, $Cancel)'
-            $callLine = 'Start-SshReverseTunnel -FromSsm $FromSsm -ToSsm $ToSsm -Username $Username -PrivateKey $PrivateKey -BindAddress $BindAddress -BindPort $BindPort -LocalPort $LocalPort -Cancel $Cancel'
+            $paramLine = 'param($FromSsm, $ToSsm, $Username, $PrivateKey, $BindAddress, [int]$BindPort, [int]$LocalPort)'
+            $callLine = 'Start-SshReverseTunnel -FromSsm $FromSsm -ToSsm $ToSsm -Username $Username -PrivateKey $PrivateKey -BindAddress $BindAddress -BindPort $BindPort -LocalPort $LocalPort'
             $wrapperScript = $paramLine + "`n" + $sshScriptContent + "`n" + $callLine
             $sshPs = [powershell]::Create()
             $null = $sshPs.AddScript($wrapperScript)
-            $null = $sshPs.AddParameter('FromSsm', $script:ssmToSsh.Reader)
-            $null = $sshPs.AddParameter('ToSsm', $script:sshToSsm.Writer)
+            $null = $sshPs.AddParameter('FromSsm', $script:ssmToSsh)
+            $null = $sshPs.AddParameter('ToSsm', $script:sshToSsm)
             $null = $sshPs.AddParameter('Username', $SshUser)
             $null = $sshPs.AddParameter('PrivateKey', $rsa)
             $null = $sshPs.AddParameter('BindAddress', $SshBindAddress)
             $null = $sshPs.AddParameter('BindPort', $SshBindPort)
             $null = $sshPs.AddParameter('LocalPort', $SshLocalPort)
-            $null = $sshPs.AddParameter('Cancel', $script:sshCts.Token)
             $script:sshHandle = $sshPs.BeginInvoke()
             $script:sshPs = $sshPs
             [Console]::Error.WriteLine("SSH bridge mode active for sessionId $sessionId.")
@@ -792,7 +790,7 @@ while($script:running -and $script:ws.State -eq [System.Net.WebSockets.WebSocket
     # ── 3b. SSH Bridge: drain sshToSsm channel ────────────────────────
     if($script:streamMode -eq 'ssh-bridge' -and $script:sshToSsm){
         $sshChunk = $null
-        while($script:sshToSsm.Reader.TryRead([ref]$sshChunk)){
+        while($script:sshToSsm.TryTake([ref]$sshChunk, 0)){
             $didWork = $true
             if($script:useMux -and $script:sshSmuxId){
                 Write-SmuxData $script:sshSmuxId $sshChunk
@@ -958,13 +956,11 @@ while($script:running -and $script:ws.State -eq [System.Net.WebSockets.WebSocket
     if($script:stdinStream){ try{$script:stdinStream.Dispose()}catch{} }
     if($script:stdoutStream){ try{$script:stdoutStream.Dispose()}catch{} }
     # SSH bridge cleanup
-    if($script:sshCts){ try{$script:sshCts.Cancel()}catch{} }
-    if($script:ssmToSsh){ try{$null = $script:ssmToSsh.Writer.TryComplete($null)}catch{} }
+    if($script:ssmToSsh){ try{$script:ssmToSsh.CompleteAdding()}catch{} }
     if($script:sshHandle -and -not $script:sshHandle.IsCompleted){
         try{ $script:sshHandle.AsyncWaitHandle.WaitOne(5000) | Out-Null }catch{}
     }
     if($script:sshPs){ try{$script:sshPs.Dispose()}catch{} }
-    if($script:sshCts){ try{$script:sshCts.Dispose()}catch{} }
     if($script:ws){ $script:ws.Dispose() }
     $msgBuild.Dispose()
     [Console]::Error.WriteLine('Session ended.')

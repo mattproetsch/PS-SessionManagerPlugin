@@ -1,4 +1,4 @@
-#Requires -Version 7.0
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Reverse port forward through AWS SSM: binds a port on a remote EC2 instance

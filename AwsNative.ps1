@@ -1,8 +1,9 @@
-#Requires -Version 7.0
+#Requires -Version 5.1
 <#
 .SYNOPSIS
     Native PowerShell AWS SigV4 signing and SSM API client.
     Replaces the AWS CLI dependency for SSM API calls.
+    Compatible with PowerShell 5.1 / .NET Framework 4.7.2+.
 #>
 
 # ── INI File Parser ─────────────────────────────────────────────────────────
@@ -54,11 +55,9 @@ function Get-AwsSsoCredential {
     $accountId = $prof['sso_account_id']
     $roleName  = $prof['sso_role_name']
 
-    # Get SSO session info
     $ssoRegion = $null; $startUrl = $null
     if ($prof.ContainsKey('sso_session')) {
-        $sessName = $prof['sso_session']
-        $sessKey = "sso-session $sessName"
+        $sessKey = "sso-session $($prof['sso_session'])"
         if ($Config.Contains($sessKey)) {
             $ssoRegion = $Config[$sessKey]['sso_region']
             $startUrl  = $Config[$sessKey]['sso_start_url']
@@ -70,7 +69,6 @@ function Get-AwsSsoCredential {
         throw "SSO profile '$ProfileSection' missing sso_region or sso_start_url."
     }
 
-    # Find the SSO token from cache (search all cache files for matching startUrl with valid accessToken)
     $cacheDir = Join-Path $HOME '.aws/sso/cache'
     $accessToken = $null
     if (Test-Path $cacheDir) {
@@ -91,12 +89,8 @@ function Get-AwsSsoCredential {
         throw "No valid SSO token found for '$startUrl'. Run: aws sso login --profile $($ProfileSection -replace '^profile ','')"
     }
 
-    # Call SSO GetRoleCredentials API (unauthenticated - uses Bearer token)
-    $ssoEndpoint = "https://portal.sso.$ssoRegion.amazonaws.com/federation/credentials"
-    $queryParams = "account_id=$([uri]::EscapeDataString($accountId))&role_name=$([uri]::EscapeDataString($roleName))"
-    $resp = Invoke-WebRequest -Uri "$ssoEndpoint`?$queryParams" -Method GET `
-        -Headers @{ 'x-amz-sso_bearer_token' = $accessToken } -UseBasicParsing
-    $rc = ConvertFrom-Json $resp.Content
+    $content = _HttpGet "https://portal.sso.$ssoRegion.amazonaws.com/federation/credentials?account_id=$([uri]::EscapeDataString($accountId))&role_name=$([uri]::EscapeDataString($roleName))" @{ 'x-amz-sso_bearer_token' = $accessToken }
+    $rc = ConvertFrom-Json $content
     [PSCustomObject]@{
         AccessKeyId     = $rc.roleCredentials.accessKeyId
         SecretAccessKey  = $rc.roleCredentials.secretAccessKey
@@ -145,7 +139,12 @@ function Get-AwsCredential {
     throw "No AWS credentials found. Checked: environment variables, $credPath [$profKey], $configPath [$cfgKey]."
 }
 
-# ── SigV4 Signing ──────────────────────────────────────────────────────────
+# ── HTTP Helpers (PS 5.1 compatible — no -SkipHeaderValidation) ─────────────
+
+function _Sha256([byte[]]$data) {
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { ,$sha.ComputeHash($data) } finally { $sha.Dispose() }
+}
 
 function _BytesToHex([byte[]]$b) {
     $sb = [System.Text.StringBuilder]::new($b.Length * 2)
@@ -155,8 +154,55 @@ function _BytesToHex([byte[]]$b) {
 
 function _HmacSha256([byte[]]$Key, [byte[]]$Data) {
     $hmac = [System.Security.Cryptography.HMACSHA256]::new($Key)
-    try { $hmac.ComputeHash($Data) } finally { $hmac.Dispose() }
+    try { ,$hmac.ComputeHash($Data) } finally { $hmac.Dispose() }
 }
+
+function _HttpPost([string]$Uri, [hashtable]$Headers, [string]$Body) {
+    # Use HttpWebRequest directly — PS 5.1's Invoke-WebRequest rejects the
+    # AWS SigV4 Authorization header value.
+    $req = [System.Net.HttpWebRequest]::Create($Uri)
+    $req.Method = 'POST'
+    $req.ContentType = $Headers['content-type']
+    foreach ($k in $Headers.Keys) {
+        if ($k -eq 'content-type') { continue }
+        if ($k -eq 'host') { $req.Host = $Headers[$k]; continue }
+        $req.Headers.Add($k, $Headers[$k])
+    }
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($Body)
+    $req.ContentLength = $bodyBytes.Length
+    $rs = $req.GetRequestStream()
+    $rs.Write($bodyBytes, 0, $bodyBytes.Length)
+    $rs.Close()
+
+    try {
+        $resp = $req.GetResponse()
+    } catch [System.Net.WebException] {
+        $errResp = $_.Exception.Response
+        if ($errResp) {
+            $sr = New-Object System.IO.StreamReader($errResp.GetResponseStream())
+            $errBody = $sr.ReadToEnd(); $sr.Close(); $errResp.Close()
+            throw $errBody
+        }
+        throw
+    }
+    $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+    $content = $sr.ReadToEnd(); $sr.Close(); $resp.Close()
+    $content
+}
+
+function _HttpGet([string]$Uri, [hashtable]$Headers) {
+    $req = [System.Net.HttpWebRequest]::Create($Uri)
+    $req.Method = 'GET'
+    foreach ($k in $Headers.Keys) {
+        $req.Headers.Add($k, $Headers[$k])
+    }
+    $resp = $req.GetResponse()
+    $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+    $content = $sr.ReadToEnd(); $sr.Close(); $resp.Close()
+    $content
+}
+
+# ── SigV4 Signing ──────────────────────────────────────────────────────────
 
 function ConvertTo-SigV4Auth {
     param(
@@ -173,42 +219,31 @@ function ConvertTo-SigV4Auth {
     $dateStamp = $now.ToString('yyyyMMdd')
     $dateTime  = $now.ToString('yyyyMMddTHHmmssZ')
 
-    # Add date header
     $Headers['x-amz-date'] = $dateTime
     if ($Cred.SessionToken) {
         $Headers['x-amz-security-token'] = $Cred.SessionToken
     }
 
-    # Canonical headers (sorted lowercase keys)
     $sortedKeys = @($Headers.Keys | Sort-Object { $_.ToLower() })
     $canonHeaders = ($sortedKeys | ForEach-Object { "$($_.ToLower()):$($Headers[$_].Trim())" }) -join "`n"
     $signedHeaders = ($sortedKeys | ForEach-Object { $_.ToLower() }) -join ';'
 
-    # Payload hash
-    $payloadHash = _BytesToHex ([System.Security.Cryptography.SHA256]::HashData($enc.GetBytes($Body)))
+    $payloadHash = _BytesToHex (_Sha256 $enc.GetBytes($Body))
 
-    # Canonical request
     $canonReq = "$Method`n$($Uri.AbsolutePath)`n`n$canonHeaders`n`n$signedHeaders`n$payloadHash"
-    $canonReqHash = _BytesToHex ([System.Security.Cryptography.SHA256]::HashData($enc.GetBytes($canonReq)))
+    $canonReqHash = _BytesToHex (_Sha256 $enc.GetBytes($canonReq))
 
-    # Credential scope
     $scope = "$dateStamp/$Region/$Service/aws4_request"
-
-    # String to sign
     $stringToSign = "AWS4-HMAC-SHA256`n$dateTime`n$scope`n$canonReqHash"
 
-    # Signing key
     $kDate    = _HmacSha256 ($enc.GetBytes("AWS4$($Cred.SecretAccessKey)")) ($enc.GetBytes($dateStamp))
     $kRegion  = _HmacSha256 $kDate ($enc.GetBytes($Region))
     $kService = _HmacSha256 $kRegion ($enc.GetBytes($Service))
     $kSigning = _HmacSha256 $kService ($enc.GetBytes('aws4_request'))
 
-    # Signature
     $sig = _BytesToHex (_HmacSha256 $kSigning ($enc.GetBytes($stringToSign)))
 
-    # Authorization header
-    $auth = "AWS4-HMAC-SHA256 Credential=$($Cred.AccessKeyId)/$scope, SignedHeaders=$signedHeaders, Signature=$sig"
-    $Headers['Authorization'] = $auth
+    $Headers['Authorization'] = "AWS4-HMAC-SHA256 Credential=$($Cred.AccessKeyId)/$scope, SignedHeaders=$signedHeaders, Signature=$sig"
     $Headers
 }
 
@@ -223,29 +258,19 @@ function Invoke-AwsSsmApi {
     )
     $resolvedRegion = Get-AwsRegion -Region $Region -Profile $Profile
     $cred = Get-AwsCredential -Profile $Profile
-    $endpoint = "https://ssm.$resolvedRegion.amazonaws.com"
-    $jsonBody = ConvertTo-Json $Body -Compress -Depth 20
     $host_ = "ssm.$resolvedRegion.amazonaws.com"
+    $jsonBody = ConvertTo-Json $Body -Compress -Depth 20
 
     $headers = [ordered]@{
         'content-type' = 'application/x-amz-json-1.1'
         'host'         = $host_
         'x-amz-target' = "AmazonSSM.$Action"
     }
-
-    $signed = ConvertTo-SigV4Auth -Method 'POST' -Uri ([uri]$endpoint) -Headers $headers `
+    $null = ConvertTo-SigV4Auth -Method 'POST' -Uri ([uri]"https://$host_") -Headers $headers `
         -Body $jsonBody -Service 'ssm' -Region $resolvedRegion -Cred $cred
 
-    # Build headers for Invoke-WebRequest (exclude 'host' as it's set automatically)
-    $reqHeaders = @{}
-    foreach ($k in $signed.Keys) {
-        if ($k -ne 'host') { $reqHeaders[$k] = $signed[$k] }
-    }
-
-    $resp = Invoke-WebRequest -Uri "$endpoint/" -Method POST -Headers $reqHeaders `
-        -Body $jsonBody -ContentType 'application/x-amz-json-1.1' -UseBasicParsing -SkipHeaderValidation
-    $body_ = if ($resp.Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($resp.Content) } else { $resp.Content }
-    ConvertFrom-Json $body_
+    $content = _HttpPost "https://$host_/" $headers $jsonBody
+    ConvertFrom-Json $content
 }
 
 function Invoke-AwsSsmApiNoFail {
@@ -261,41 +286,4 @@ function Invoke-AwsSsmApiNoFail {
         [Console]::Error.WriteLine("SSM $Action (non-fatal): $_")
         $null
     }
-}
-
-# ── Generic AWS API Client (for STS etc.) ───────────────────────────────────
-
-function Invoke-AwsApi {
-    param(
-        [Parameter(Mandatory)][string]$Service,
-        [Parameter(Mandatory)][string]$Action,
-        [string]$TargetPrefix,
-        [hashtable]$Body = @{},
-        [string]$Profile,
-        [string]$Region
-    )
-    $resolvedRegion = Get-AwsRegion -Region $Region -Profile $Profile
-    $cred = Get-AwsCredential -Profile $Profile
-    $endpoint = "https://$Service.$resolvedRegion.amazonaws.com"
-    $jsonBody = ConvertTo-Json $Body -Compress -Depth 20
-    $host_ = "$Service.$resolvedRegion.amazonaws.com"
-
-    $headers = [ordered]@{
-        'content-type' = 'application/x-amz-json-1.1'
-        'host'         = $host_
-    }
-    if ($TargetPrefix) { $headers['x-amz-target'] = "$TargetPrefix.$Action" }
-
-    $signed = ConvertTo-SigV4Auth -Method 'POST' -Uri ([uri]$endpoint) -Headers $headers `
-        -Body $jsonBody -Service $Service -Region $resolvedRegion -Cred $cred
-
-    $reqHeaders = @{}
-    foreach ($k in $signed.Keys) {
-        if ($k -ne 'host') { $reqHeaders[$k] = $signed[$k] }
-    }
-
-    $resp = Invoke-WebRequest -Uri "$endpoint/" -Method POST -Headers $reqHeaders `
-        -Body $jsonBody -ContentType 'application/x-amz-json-1.1' -UseBasicParsing -SkipHeaderValidation
-    $body_ = if ($resp.Content -is [byte[]]) { [System.Text.Encoding]::UTF8.GetString($resp.Content) } else { $resp.Content }
-    ConvertFrom-Json $body_
 }
