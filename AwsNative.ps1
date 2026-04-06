@@ -46,6 +46,138 @@ function Get-AwsRegion {
     throw 'No AWS region found. Set -Region parameter, AWS_REGION env var, or region in ~/.aws/config.'
 }
 
+function _HttpPostJson([string]$Uri, [hashtable]$Body) {
+    # Simple unauthenticated JSON POST (for SSO OIDC endpoints)
+    $json = ConvertTo-Json $Body -Compress -Depth 10
+    $req  = [System.Net.HttpWebRequest]::Create($Uri)
+    $req.Method      = 'POST'
+    $req.ContentType = 'application/json'
+    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+    $req.ContentLength = $bodyBytes.Length
+    $rs = $req.GetRequestStream()
+    $rs.Write($bodyBytes, 0, $bodyBytes.Length); $rs.Close()
+
+    try {
+        $resp = $req.GetResponse()
+    } catch [System.Net.WebException] {
+        $errResp = $_.Exception.Response
+        if ($errResp) {
+            $sr = New-Object System.IO.StreamReader($errResp.GetResponseStream())
+            $errBody = $sr.ReadToEnd(); $sr.Close(); $errResp.Close()
+            throw $errBody
+        }
+        throw
+    }
+    $sr = New-Object System.IO.StreamReader($resp.GetResponseStream())
+    $content = $sr.ReadToEnd(); $sr.Close(); $resp.Close()
+    ConvertFrom-Json $content
+}
+
+function _Sha1Hex([string]$text) {
+    $sha = [System.Security.Cryptography.SHA1]::Create()
+    $hash = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($text))
+    $sha.Dispose()
+    _BytesToHex $hash
+}
+
+function Invoke-AwsSsoLogin {
+    <#
+    .SYNOPSIS
+        Performs AWS SSO device-authorization login (replaces "aws sso login").
+        Opens a browser for the user to authorize, polls for the token, caches it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$StartUrl,
+        [Parameter(Mandatory)][string]$SsoRegion
+    )
+    $oidcBase = "https://oidc.$SsoRegion.amazonaws.com"
+
+    # 1. Register client
+    Write-Host '[SSO] Registering OIDC client...' -ForegroundColor Cyan
+    $reg = _HttpPostJson "$oidcBase/client/register" @{
+        clientName = 'PS-SessionManagerPlugin'
+        clientType = 'public'
+        scopes     = @('sso:account:access')
+    }
+
+    # 2. Start device authorization
+    $authz = _HttpPostJson "$oidcBase/device_authorization" @{
+        clientId     = $reg.clientId
+        clientSecret = $reg.clientSecret
+        startUrl     = $StartUrl
+    }
+
+    # 3. Prompt user to open browser
+    $verifyUrl = $authz.verificationUriComplete
+    Write-Host ''
+    Write-Host '[SSO] Open this URL in your browser to authorize:' -ForegroundColor Yellow
+    Write-Host "      $verifyUrl" -ForegroundColor White
+    Write-Host ''
+    Write-Host "      User code: $($authz.userCode)" -ForegroundColor White
+    Write-Host ''
+
+    # Try to open the browser automatically
+    try {
+        if ($env:OS -match 'Windows') {
+            Start-Process $verifyUrl
+        } elseif (Test-Path '/usr/bin/xdg-open') {
+            & xdg-open $verifyUrl 2>$null
+        } elseif (Test-Path '/usr/bin/open') {
+            & open $verifyUrl 2>$null
+        }
+    } catch {}
+
+    Write-Host '[SSO] Waiting for authorization...' -ForegroundColor Cyan
+
+    # 4. Poll for token
+    $interval = if ($authz.interval) { [int]$authz.interval } else { 5 }
+    $deadline = [DateTime]::UtcNow.AddSeconds([int]$authz.expiresIn)
+    $token = $null
+
+    while ([DateTime]::UtcNow -lt $deadline) {
+        Start-Sleep -Seconds $interval
+        try {
+            $token = _HttpPostJson "$oidcBase/token" @{
+                clientId     = $reg.clientId
+                clientSecret = $reg.clientSecret
+                grantType    = 'urn:ietf:params:oauth:grant-type:device_code'
+                deviceCode   = $authz.deviceCode
+            }
+            break
+        } catch {
+            $err = $_.ToString()
+            if ($err -match 'authorization_pending' -or $err -match 'slow_down') {
+                continue
+            }
+            throw "SSO token exchange failed: $err"
+        }
+    }
+    if (-not $token) { throw 'SSO login timed out.' }
+
+    Write-Host '[SSO] Login successful!' -ForegroundColor Green
+
+    # 5. Cache the token in ~/.aws/sso/cache/ (same format as AWS CLI)
+    $cacheDir = Join-Path $HOME '.aws/sso/cache'
+    if (-not (Test-Path $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
+
+    $cacheEntry = @{
+        startUrl               = $StartUrl
+        region                 = $SsoRegion
+        accessToken            = $token.accessToken
+        expiresAt              = [DateTime]::UtcNow.AddSeconds([int]$token.expiresIn).ToString('yyyy-MM-ddTHH:mm:ssZ')
+        clientId               = $reg.clientId
+        clientSecret           = $reg.clientSecret
+        registrationExpiresAt  = [DateTimeOffset]::FromUnixTimeSeconds([long]$reg.clientSecretExpiresAt).UtcDateTime.ToString('yyyy-MM-ddTHH:mm:ssZ')
+    }
+    if ($token.refreshToken) { $cacheEntry.refreshToken = $token.refreshToken }
+
+    $cacheJson = ConvertTo-Json $cacheEntry -Compress
+    $cacheFile = Join-Path $cacheDir "$(_Sha1Hex $StartUrl).json"
+    Set-Content -Path $cacheFile -Value $cacheJson -Encoding UTF8
+
+    return $token.accessToken
+}
+
 function Get-AwsSsoCredential {
     param(
         [System.Collections.Specialized.OrderedDictionary]$Config,
@@ -86,7 +218,8 @@ function Get-AwsSsoCredential {
         }
     }
     if (-not $accessToken) {
-        throw "No valid SSO token found for '$startUrl'. Run: aws sso login --profile $($ProfileSection -replace '^profile ','')"
+        # No valid token — run the device-authorization login flow interactively
+        $accessToken = Invoke-AwsSsoLogin -StartUrl $startUrl -SsoRegion $ssoRegion
     }
 
     $content = _HttpGet "https://portal.sso.$ssoRegion.amazonaws.com/federation/credentials?account_id=$([uri]::EscapeDataString($accountId))&role_name=$([uri]::EscapeDataString($roleName))" @{ 'x-amz-sso_bearer_token' = $accessToken }
