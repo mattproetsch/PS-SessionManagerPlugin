@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+#Requires -Version 7.0
 <#
 .SYNOPSIS
     Reverse port forward through AWS SSM: binds a port on a remote EC2 instance
@@ -12,6 +12,9 @@
     - Deploys the public key to the instance via SSM Run Command
     - Configures sshd to allow gateway ports (so the remote port is reachable)
     - Opens SSH -R tunnel through SSM
+
+    No external binaries required - pure PowerShell implementation.
+    Uses native AWS SigV4 signing (no AWS CLI) and in-process SSH client (no ssh binary).
 
 .EXAMPLE
     .\Start-ReverseTunnel.ps1 -InstanceId i-0123456789abcdef0 -RemotePort 8080 -LocalPort 3000
@@ -35,29 +38,12 @@ Set-StrictMode -Version Latest
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
+# ── Load native modules ────────────────────────────────────────────────────
+
+. "$ScriptDir/AwsNative.ps1"
+. "$ScriptDir/SshClient.ps1"
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
-
-function Invoke-Aws {
-    param([string[]]$Args)
-    $cmd = @('aws') + $Args
-    if ($Profile) { $cmd += '--profile'; $cmd += $Profile }
-    if ($Region)  { $cmd += '--region';  $cmd += $Region }
-    $result = & $cmd[0] $cmd[1..($cmd.Length-1)] 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        $err = ($result | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }) -join "`n"
-        throw "aws $($Args[0..1] -join ' ') failed: $err"
-    }
-    ($result | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n"
-}
-
-function Invoke-AwsNoFail {
-    param([string[]]$Args)
-    $cmd = @('aws') + $Args
-    if ($Profile) { $cmd += '--profile'; $cmd += $Profile }
-    if ($Region)  { $cmd += '--region';  $cmd += $Region }
-    $result = & $cmd[0] $cmd[1..($cmd.Length-1)] 2>$null
-    $result -join "`n"
-}
 
 function Write-Step([string]$msg) { Write-Host "[*] $msg" -ForegroundColor Cyan }
 function Write-Ok([string]$msg)   { Write-Host "[+] $msg" -ForegroundColor Green }
@@ -69,9 +55,10 @@ Write-Step "Checking SSM document '$DocumentName'..."
 
 $docExists = $false
 try {
-    $docInfo = Invoke-AwsNoFail @('ssm', 'describe-document',
-        '--name', $DocumentName, '--query', 'Document.Status', '--output', 'text')
-    if ($docInfo -and $docInfo.Trim() -eq 'Active') { $docExists = $true }
+    $docInfo = Invoke-AwsSsmApiNoFail -Action 'DescribeDocument' -Body @{
+        Name = $DocumentName
+    } -Profile $Profile -Region $Region
+    if ($docInfo -and $docInfo.Document.Status -eq 'Active') { $docExists = $true }
 } catch {}
 
 if ($docExists) {
@@ -96,61 +83,59 @@ if ($docExists) {
   }
 }
 '@
-    $tmpDoc = [System.IO.Path]::GetTempFileName()
-    Set-Content -Path $tmpDoc -Value $docContent -Encoding UTF8
     try {
-        Invoke-Aws @('ssm', 'create-document',
-            '--name', $DocumentName,
-            '--document-type', 'Session',
-            '--document-format', 'JSON',
-            '--content', "file://$tmpDoc",
-            '--query', 'DocumentDescription.Status', '--output', 'text')
+        Invoke-AwsSsmApi -Action 'CreateDocument' -Body @{
+            Name           = $DocumentName
+            DocumentType   = 'Session'
+            DocumentFormat = 'JSON'
+            Content        = $docContent
+        } -Profile $Profile -Region $Region | Out-Null
         Write-Ok "Document created."
-    } finally {
-        Remove-Item $tmpDoc -Force -ErrorAction SilentlyContinue
+    } catch {
+        if ($_ -match 'DocumentAlreadyExists') {
+            Write-Ok "Document '$DocumentName' already exists (race)."
+        } else { throw }
     }
 }
 
 # ── 2. Ensure SSH Key Pair ──────────────────────────────────────────────────
 
 if (-not $SshKeyPath) {
-    $sshDir = Join-Path $env:USERPROFILE '.ssh'
-    if (-not (Test-Path $sshDir)) {
-        $sshDir = Join-Path $HOME '.ssh'
-    }
-    # Prefer ed25519, fall back to rsa
-    $candidates = @(
-        (Join-Path $sshDir 'id_ed25519'),
-        (Join-Path $sshDir 'id_rsa')
-    )
-    foreach ($c in $candidates) {
-        if (Test-Path $c) { $SshKeyPath = $c; break }
-    }
+    $sshDir = Join-Path $HOME '.ssh'
+    # Use a dedicated key for SSM tunneling to avoid encrypted/incompatible user keys
+    $SshKeyPath = Join-Path $sshDir 'id_rsa_ssm_tunnel'
 }
 
-if (-not $SshKeyPath -or -not (Test-Path $SshKeyPath)) {
-    $sshDir = Join-Path $HOME '.ssh'
+if (-not (Test-Path $SshKeyPath)) {
+    $sshDir = Split-Path $SshKeyPath
     if (-not (Test-Path $sshDir)) { New-Item -ItemType Directory -Path $sshDir -Force | Out-Null }
-    $SshKeyPath = Join-Path $sshDir 'id_ed25519'
-    Write-Step "Generating SSH key pair at $SshKeyPath..."
-    & ssh-keygen -t ed25519 -f $SshKeyPath -N '' -q
-    if ($LASTEXITCODE -ne 0) { throw "ssh-keygen failed" }
+    Write-Step "Generating RSA-4096 key pair at $SshKeyPath..."
+    $kp = New-SshRsaKeyPair -KeyBits 4096 -Comment "$SshUser@ssm-tunnel"
+    Set-Content -Path $SshKeyPath -Value $kp.PrivateKeyPem -NoNewline
+    if ($IsLinux -or $IsMacOS) {
+        chmod 600 $SshKeyPath 2>$null
+    }
+    Set-Content -Path "$SshKeyPath.pub" -Value $kp.PublicKeyLine -NoNewline
     Write-Ok "Key pair generated."
 } else {
     Write-Ok "Using SSH key: $SshKeyPath"
 }
 
 $pubKeyPath = "$SshKeyPath.pub"
-if (-not (Test-Path $pubKeyPath)) { throw "Public key not found: $pubKeyPath" }
+if (-not (Test-Path $pubKeyPath)) {
+    # Generate .pub from the private key
+    Write-Step "Extracting public key from $SshKeyPath..."
+    $rsa = Import-SshPrivateKey $SshKeyPath
+    $pubLine = Export-SshPublicKey $rsa "$SshUser@ssm-tunnel"
+    Set-Content -Path $pubKeyPath -Value $pubLine -NoNewline
+    $rsa.Dispose()
+}
 $pubKey = (Get-Content $pubKeyPath -Raw).Trim()
 
 # ── 3. Deploy SSH Key & Configure sshd via Run Command ─────────────────────
 
 Write-Step "Deploying SSH key to $InstanceId via SSM Run Command..."
 
-# Build commands as an array of individual lines (avoids heredoc escaping issues).
-# This script is idempotent: only adds the key if not present,
-# only modifies sshd_config if GatewayPorts not already set.
 $cmds = @(
     'set -e',
     "SSH_USER=`"$SshUser`"",
@@ -179,26 +164,25 @@ $cmds = @(
     'fi',
     'echo SETUP_COMPLETE'
 )
-$cmdJson = ConvertTo-Json $cmds -Compress
 
-$cmdId = Invoke-Aws @('ssm', 'send-command',
-    '--instance-ids', $InstanceId,
-    '--document-name', 'AWS-RunShellScript',
-    '--parameters', "{`"commands`":$cmdJson}",
-    '--query', 'Command.CommandId', '--output', 'text')
-$cmdId = $cmdId.Trim()
+$cmdResult = Invoke-AwsSsmApi -Action 'SendCommand' -Body @{
+    InstanceIds  = @($InstanceId)
+    DocumentName = 'AWS-RunShellScript'
+    Parameters   = @{ commands = $cmds }
+} -Profile $Profile -Region $Region
+$cmdId = $cmdResult.Command.CommandId
 
 Write-Step "Waiting for Run Command $cmdId..."
 $maxWait = 60
 for ($i = 0; $i -lt $maxWait; $i++) {
     Start-Sleep -Seconds 2
-    $status = (Invoke-AwsNoFail @('ssm', 'get-command-invocation',
-        '--command-id', $cmdId, '--instance-id', $InstanceId,
-        '--query', 'Status', '--output', 'text')).Trim()
+    $invResult = Invoke-AwsSsmApiNoFail -Action 'GetCommandInvocation' -Body @{
+        CommandId  = $cmdId
+        InstanceId = $InstanceId
+    } -Profile $Profile -Region $Region
+    $status = if ($invResult) { $invResult.Status } else { '' }
     if ($status -eq 'Success') {
-        $output = Invoke-Aws @('ssm', 'get-command-invocation',
-            '--command-id', $cmdId, '--instance-id', $InstanceId,
-            '--query', 'StandardOutputContent', '--output', 'text')
+        $output = $invResult.StandardOutputContent
         if ($output -match 'SETUP_COMPLETE') {
             Write-Ok "Instance setup complete."
             $output.Trim().Split("`n") | ForEach-Object {
@@ -209,9 +193,7 @@ for ($i = 0; $i -lt $maxWait; $i++) {
         }
         break
     } elseif ($status -eq 'Failed' -or $status -eq 'TimedOut' -or $status -eq 'Cancelled') {
-        $errOut = Invoke-AwsNoFail @('ssm', 'get-command-invocation',
-            '--command-id', $cmdId, '--instance-id', $InstanceId,
-            '--query', 'StandardErrorContent', '--output', 'text')
+        $errOut = if ($invResult) { $invResult.StandardErrorContent } else { 'unknown' }
         throw "Run Command failed ($status): $errOut"
     }
 }
@@ -224,35 +206,21 @@ Write-Step "Starting reverse tunnel: $InstanceId`:$RemotePort --> localhost:$Loc
 Write-Host "    Press Ctrl+C to stop."
 Write-Host ""
 
-# Build the SSH ProxyCommand. AWS CLI start-session invokes session-manager-plugin
-# (our .cmd wrapper) which runs ssm-port-forward.ps1 in stdio mode.
-$proxyArgs = @(
-    'ssm', 'start-session',
-    '--target', $InstanceId,
-    '--document-name', $DocumentName,
-    '--parameters', "{`"portNumber`":[`"22`"]}"
-)
-if ($Profile) { $proxyArgs += '--profile'; $proxyArgs += $Profile }
-if ($Region)  { $proxyArgs += '--region';  $proxyArgs += $Region }
-$proxyCmd = "aws $($proxyArgs -join ' ')"
-
-$sshArgs = @(
-    '-i', $SshKeyPath,
-    '-o', 'StrictHostKeyChecking=no',
-    '-o', 'UserKnownHostsFile=/dev/null',
-    '-o', "ProxyCommand=$proxyCmd",
-    '-o', 'ServerAliveInterval=60',
-    '-R', "0.0.0.0:${RemotePort}:localhost:${LocalPort}",
-    '-N',
-    "$SshUser@$InstanceId"
-)
+# Start SSM session natively
+$resolvedRegion = Get-AwsRegion -Region $Region -Profile $Profile
+$sess = Invoke-AwsSsmApi -Action 'StartSession' -Body @{
+    Target       = $InstanceId
+    DocumentName = 'AWS-StartPortForwardingSession'
+    Parameters   = @{ portNumber = @('22'); localPortNumber = @('0') }
+} -Profile $Profile -Region $Region
+$sessJson = ConvertTo-Json $sess -Compress -Depth 10
 
 Write-Ok "Tunnel active: $InstanceId`:$RemotePort --> localhost:$LocalPort"
-& ssh @sshArgs
-$sshExit = $LASTEXITCODE
 
-if ($sshExit -ne 0) {
-    Write-Warn "SSH exited with code $sshExit"
-} else {
-    Write-Ok "Tunnel closed."
-}
+# Launch ssm-port-forward.ps1 in SSH Bridge mode
+& "$ScriptDir/ssm-port-forward.ps1" $sessJson $resolvedRegion 'StartSession' '' `
+    (ConvertTo-Json @{Target=$InstanceId} -Compress) "https://ssm.$resolvedRegion.amazonaws.com" `
+    -SshBridgeMode -SshUser $SshUser -SshKeyPath $SshKeyPath `
+    -SshBindAddress '0.0.0.0' -SshBindPort $RemotePort -SshLocalPort $LocalPort
+
+Write-Ok "Tunnel closed."

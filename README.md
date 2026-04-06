@@ -70,14 +70,19 @@ Place these files in a directory on your `PATH`:
 | File                         | Purpose                                         |
 |------------------------------|--------------------------------------------------|
 | `ssm-port-forward.ps1`      | SSM plugin (protocol, WebSocket, smux, TCP)      |
-| `session-manager-plugin.cmd` | Wrapper invoked by AWS CLI                       |
+| `AwsNative.ps1`             | Native AWS SigV4 signing and SSM API client       |
+| `SshClient.ps1`             | Pure PowerShell SSH client for reverse tunneling   |
 | `Start-ReverseTunnel.ps1`   | Reverse tunnel orchestrator                      |
+| `session-manager-plugin.cmd` | Legacy wrapper for AWS CLI `start-session`        |
 
 ### Requirements
 
-- Windows 10 1809+ with PowerShell 5.1 and native `ssh.exe`
-- AWS CLI v2
+- PowerShell 7+ (.NET 8+) — a self-contained `pwsh` runtime is bundled
 - EC2 instance with SSM Agent and `AmazonSSMManagedInstanceCore` IAM policy
+- AWS credentials (environment variables, `~/.aws/credentials`, or SSO)
+
+No external binaries required — no AWS CLI, no `ssh`, no `ssh-keygen`.
+Everything is implemented natively in PowerShell/.NET.
 
 ## How It Works
 
@@ -89,17 +94,24 @@ The plugin reimplements the SSM data channel protocol in PowerShell:
 - **smux multiplexing** (8-byte Little-Endian frame protocol for concurrent connections)
 - **Two I/O modes**: TCP listener (standard port forwarding) and stdin/stdout pipe (SSH ProxyCommand)
 
-For reverse port forwarding, the plugin runs in stdin/stdout mode as an SSH
-`ProxyCommand`. SSH handles the reverse tunnel (`-R`) at the protocol level
-while the plugin provides the SSM transport.
+For reverse port forwarding, an in-process SSH client (`SshClient.ps1`)
+runs inside `ssm-port-forward.ps1`. The SSH client negotiates a reverse
+tunnel (`tcpip-forward`) over the SSM data channel. When connections arrive
+at the remote port, the SSH client handles the `forwarded-tcpip` channels
+and connects them to the local target port.
 
 ```
 Traffic to EC2:8080
   -> sshd reverse tunnel
-  -> SSM data channel (WebSocket)
+  -> SSH client (in-process, SshClient.ps1)
+  -> SSM data channel (WebSocket, smux)
   -> ssm-port-forward.ps1
   -> localhost:3000 on your machine
 ```
+
+No external binaries are involved — the SSH protocol (key exchange, auth,
+channels) is implemented purely in PowerShell/.NET, and AWS API calls use
+native SigV4 signing.
 
 ## Troubleshooting
 

@@ -15,7 +15,14 @@ param(
     [Parameter(Position=2)][string]$Operation = 'StartSession',
     [Parameter(Position=3)][string]$Profile,
     [Parameter(Position=4)][string]$Parameters,
-    [Parameter(Position=5)][string]$Endpoint
+    [Parameter(Position=5)][string]$Endpoint,
+    # SSH Bridge Mode parameters
+    [switch]$SshBridgeMode,
+    [string]$SshUser,
+    [string]$SshKeyPath,
+    [string]$SshBindAddress = '0.0.0.0',
+    [int]$SshBindPort,
+    [int]$SshLocalPort
 )
 
 Set-StrictMode -Version Latest
@@ -307,7 +314,10 @@ function Parse-SmuxFrames {
 
         switch($hdr[1]){
             $SMUX_PSH {
-                if($fdata -and $script:conns.ContainsKey($sid)){
+                if($fdata -and $script:streamMode -eq 'ssh-bridge' -and $sid -eq $script:sshSmuxId){
+                    # Route to SSH client channel
+                    $null = $script:ssmToSsh.Writer.TryWrite([byte[]]$fdata)
+                } elseif($fdata -and $script:conns.ContainsKey($sid)){
                     $script:conns[$sid].Pending.Add($fdata)
                 }
             }
@@ -407,7 +417,14 @@ function Process-HandshakeComplete($msg) {
 function Process-DataPayload($msg) {
     switch($msg.PayloadType){
         $PT_OUTPUT {
-            if($script:streamMode -eq 'stdio'){
+            if($script:streamMode -eq 'ssh-bridge' -and $script:useMux){
+                # SSH Bridge with smux: data goes through smux parsing
+                $script:smuxBuf.AddRange([byte[]]$msg.Payload)
+                Parse-SmuxFrames
+            } elseif($script:streamMode -eq 'ssh-bridge'){
+                # SSH Bridge without smux: feed data directly
+                $null = $script:ssmToSsh.Writer.TryWrite([byte[]]$msg.Payload)
+            } elseif($script:streamMode -eq 'stdio'){
                 # StandardStreamForwarding: write to stdout
                 if($script:stdoutStream){
                     $script:stdoutStream.Write($msg.Payload, 0, $msg.PayloadLen)
@@ -584,11 +601,16 @@ $script:listener     = $null
 $script:basicClient  = $null
 $script:basicStream  = $null
 # StandardStreamForwarding (stdin/stdout) state
-$script:streamMode   = ''          # 'tcp' or 'stdio'
+$script:streamMode   = ''          # 'tcp', 'stdio', or 'ssh-bridge'
 $script:stdinStream  = $null
 $script:stdoutStream = $null
 $script:stdinTask    = $null
 $script:stdinBuf     = $null
+# SSH Bridge mode state
+$script:ssmToSsh     = $null       # Channel<byte[]> SSM -> SSH
+$script:sshToSsm     = $null       # Channel<byte[]> SSH -> SSM
+$script:sshThread    = $null       # Background thread running SSH client
+$script:sshCts       = $null       # CancellationTokenSource for SSH
 
 # ── Connect WebSocket ────────────────────────────────────────────────────────
 
@@ -666,7 +688,50 @@ while($script:running -and $script:ws.State -eq [System.Net.WebSockets.WebSocket
             if($pp.PSObject.Properties['type']){ $portType = $pp.type }
         }
 
-        if($portType -eq 'LocalPortForwarding'){
+        if($SshBridgeMode){
+            # ── SSH Bridge mode: run SSH client in-process ──
+            $script:streamMode = 'ssh-bridge'
+
+            # Enable smux if the agent supports it (required for Port sessions)
+            try {
+                $av = [version]$script:agentVer
+                $script:useMux = $av -gt $TCP_MUX_AFTER
+            } catch { $script:useMux = $false }
+
+            # Open a smux stream to port 22
+            if($script:useMux){
+                $script:sshSmuxId = Open-SmuxStream
+                [Console]::Error.WriteLine("Opened smux stream $($script:sshSmuxId) for SSH bridge.")
+            }
+
+            $script:ssmToSsh = [System.Threading.Channels.Channel]::CreateUnbounded[byte[]]()
+            $script:sshToSsm = [System.Threading.Channels.Channel]::CreateUnbounded[byte[]]()
+            $script:sshCts   = [System.Threading.CancellationTokenSource]::new()
+
+            $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+            . "$ScriptDir/SshClient.ps1"
+
+            $rsa = Import-SshPrivateKey $SshKeyPath
+
+            # Use a PowerShell runspace for the SSH thread (raw .NET threads lack a PS runspace)
+            $sshScriptContent = Get-Content "$ScriptDir/SshClient.ps1" -Raw
+            $paramLine = 'param($FromSsm, $ToSsm, $Username, $PrivateKey, $BindAddress, [int]$BindPort, [int]$LocalPort, $Cancel)'
+            $callLine = 'Start-SshReverseTunnel -FromSsm $FromSsm -ToSsm $ToSsm -Username $Username -PrivateKey $PrivateKey -BindAddress $BindAddress -BindPort $BindPort -LocalPort $LocalPort -Cancel $Cancel'
+            $wrapperScript = $paramLine + "`n" + $sshScriptContent + "`n" + $callLine
+            $sshPs = [powershell]::Create()
+            $null = $sshPs.AddScript($wrapperScript)
+            $null = $sshPs.AddParameter('FromSsm', $script:ssmToSsh.Reader)
+            $null = $sshPs.AddParameter('ToSsm', $script:sshToSsm.Writer)
+            $null = $sshPs.AddParameter('Username', $SshUser)
+            $null = $sshPs.AddParameter('PrivateKey', $rsa)
+            $null = $sshPs.AddParameter('BindAddress', $SshBindAddress)
+            $null = $sshPs.AddParameter('BindPort', $SshBindPort)
+            $null = $sshPs.AddParameter('LocalPort', $SshLocalPort)
+            $null = $sshPs.AddParameter('Cancel', $script:sshCts.Token)
+            $script:sshHandle = $sshPs.BeginInvoke()
+            $script:sshPs = $sshPs
+            [Console]::Error.WriteLine("SSH bridge mode active for sessionId $sessionId.")
+        } elseif($portType -eq 'LocalPortForwarding') {
             # ── TCP port forwarding (mux or basic) ──
             $script:streamMode = 'tcp'
             $lpStr = ''
@@ -720,6 +785,40 @@ while($script:running -and $script:ws.State -eq [System.Net.WebSockets.WebSocket
             }
         } catch {
             [Console]::Error.WriteLine("Stdin read error: $_")
+            $script:running = $false; continue
+        }
+    }
+
+    # ── 3b. SSH Bridge: drain sshToSsm channel ────────────────────────
+    if($script:streamMode -eq 'ssh-bridge' -and $script:sshToSsm){
+        $sshChunk = $null
+        while($script:sshToSsm.Reader.TryRead([ref]$sshChunk)){
+            $didWork = $true
+            if($script:useMux -and $script:sshSmuxId){
+                Write-SmuxData $script:sshSmuxId $sshChunk
+            } else {
+                Send-Data $PT_OUTPUT $sshChunk
+            }
+        }
+        # Check if SSH runspace has completed
+        if($script:sshHandle -and $script:sshHandle.IsCompleted){
+            [Console]::Error.WriteLine('SSH client exited.')
+            try {
+                $script:sshPs.EndInvoke($script:sshHandle)
+            } catch {
+                [Console]::Error.WriteLine("SSH error: $_")
+            }
+            if($script:sshPs.Streams.Error.Count -gt 0){
+                foreach($e in $script:sshPs.Streams.Error){
+                    [Console]::Error.WriteLine("SSH: $($e.ToString())")
+                    if($e.InvocationInfo){
+                        [Console]::Error.WriteLine("  at line $($e.InvocationInfo.ScriptLineNumber)")
+                    }
+                    if($e.ScriptStackTrace){
+                        [Console]::Error.WriteLine("  $($e.ScriptStackTrace)")
+                    }
+                }
+            }
             $script:running = $false; continue
         }
     }
@@ -858,6 +957,14 @@ while($script:running -and $script:ws.State -eq [System.Net.WebSockets.WebSocket
     if($script:listener){ try{$script:listener.Stop()}catch{} }
     if($script:stdinStream){ try{$script:stdinStream.Dispose()}catch{} }
     if($script:stdoutStream){ try{$script:stdoutStream.Dispose()}catch{} }
+    # SSH bridge cleanup
+    if($script:sshCts){ try{$script:sshCts.Cancel()}catch{} }
+    if($script:ssmToSsh){ try{$null = $script:ssmToSsh.Writer.TryComplete($null)}catch{} }
+    if($script:sshHandle -and -not $script:sshHandle.IsCompleted){
+        try{ $script:sshHandle.AsyncWaitHandle.WaitOne(5000) | Out-Null }catch{}
+    }
+    if($script:sshPs){ try{$script:sshPs.Dispose()}catch{} }
+    if($script:sshCts){ try{$script:sshCts.Dispose()}catch{} }
     if($script:ws){ $script:ws.Dispose() }
     $msgBuild.Dispose()
     [Console]::Error.WriteLine('Session ended.')

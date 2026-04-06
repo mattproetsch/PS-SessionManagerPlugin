@@ -40,18 +40,20 @@ External traffic
   localhost:3000 (your dev service)
 ```
 
-SSM doesn't natively support reverse port forwarding. This setup uses SSH `-R`
-tunneled through SSM's data channel. The PowerShell plugin
-(`ssm-port-forward.ps1`) acts as the transport layer, piping SSH traffic through
-SSM via stdin/stdout.
+SSM doesn't natively support reverse port forwarding. This setup uses an
+in-process SSH client that negotiates a reverse tunnel (`tcpip-forward`)
+over the SSM data channel. The SSH protocol (key exchange, authentication,
+channels) is implemented purely in PowerShell/.NET — no external SSH binary.
 
 ## Prerequisites
 
-- **Windows 10 1809+** with PowerShell 5.1 and native `ssh.exe`
-- **AWS CLI v2** configured with a profile that has `ssm:StartSession` and
-  `ssm:SendCommand` permissions
+- **PowerShell 7+** (.NET 8+) — a self-contained `pwsh` runtime is bundled
+- **AWS credentials** (environment variables, `~/.aws/credentials`, or SSO)
+  with `ssm:StartSession`, `ssm:SendCommand`, and `ssm:DescribeDocument` permissions
 - **EC2 instance** with SSM Agent running and an IAM instance profile with
   `AmazonSSMManagedInstanceCore`
+
+No external binaries required — no AWS CLI, no `ssh`, no `ssh-keygen`.
 
 ## Installation
 
@@ -59,7 +61,8 @@ Place all files in a single directory (e.g., `C:\tools\ssm-plugin\`):
 
 ```
 ssm-port-forward.ps1          # The SSM plugin
-session-manager-plugin.cmd     # AWS CLI wrapper
+AwsNative.ps1                  # Native AWS SigV4 signing + SSM API client
+SshClient.ps1                  # Pure PowerShell SSH client
 Start-ReverseTunnel.ps1        # Orchestrator
 ```
 
