@@ -112,8 +112,8 @@ if (-not (Test-Path $SshKeyPath)) {
     Write-Step "Generating RSA-4096 key pair at $SshKeyPath..."
     $kp = New-SshRsaKeyPair -KeyBits 4096 -Comment "$SshUser@ssm-tunnel"
     Set-Content -Path $SshKeyPath -Value $kp.PrivateKeyPem -NoNewline
-    if ($IsLinux -or $IsMacOS) {
-        chmod 600 $SshKeyPath 2>$null
+    if ($env:OS -notmatch 'Windows') {
+        try { & chmod 600 $SshKeyPath 2>$null } catch {}
     }
     Set-Content -Path "$SshKeyPath.pub" -Value $kp.PublicKeyLine -NoNewline
     Write-Ok "Key pair generated."
