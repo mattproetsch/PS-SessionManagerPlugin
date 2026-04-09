@@ -40,7 +40,7 @@ $listener.Prefixes.Add($prefix)
 try {
     $listener.Start()
 } catch {
-    throw "Failed to start HTTP listener on $prefix — $_"
+    throw "Failed to start HTTP listener on $prefix - $_"
 }
 
 [Console]::Error.WriteLine("[proxy] Listening on $prefix")
